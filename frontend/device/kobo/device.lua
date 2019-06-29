@@ -658,7 +658,26 @@ function Kobo:suspend()
         logger.err('write error: ', err_msg, err_code)
     end
 
-    util.sleep(2)
+    logger.info("Kobo suspend: consuming events for 2 seconds")
+    local input = require("device").input
+    local finalize_suspend = true
+    local deadline = TimeVal:now() + TimeVal:new{sec = 2}
+    while true do
+      local now = TimeVal:now()
+      if now < deadline then
+        local delay = deadline - now 
+        local ev = input:waitEvent(delay.sec * 1000000 + delay.usec)
+        if ev then
+          if ev == "SleepCoverOpened" then
+            logger.info("Kobo suspend: cover opened while waiting")
+            finalize_suspend = false
+            break
+          end
+        end
+      else
+        break
+      end
+    end
     logger.info("Kobo suspend: waited for 2s because of reasons...")
 
     os.execute("sync")
@@ -683,41 +702,43 @@ function Kobo:suspend()
     end
 
     --]]
-
-    logger.info("Kobo suspend: asking for a suspend to RAM . . .")
-    f = io.open("/sys/power/state", "w")
-    if not f then
-        -- reset state-extend back to 0 since we are giving up
-        local ext_fd = io.open("/sys/power/state-extended", "w")
-        if not ext_fd then
-            logger.err("cannot open /sys/power/state-extended for writing!")
-        else
-            ext_fd:write("0\n")
-            io.close(ext_fd)
-        end
-        return false
+    if finalize_suspend then
+      logger.info("Kobo suspend: asking for a suspend to RAM . . .")
+      f = io.open("/sys/power/state", "w")
+      if not f then
+          -- reset state-extend back to 0 since we are giving up
+          local ext_fd = io.open("/sys/power/state-extended", "w")
+          if not ext_fd then
+              logger.err("cannot open /sys/power/state-extended for writing!")
+          else
+              ext_fd:write("0\n")
+              io.close(ext_fd)
+          end
+          return false
+      end
+      re, err_msg, err_code = f:write("mem\n")
+      -- NOTE: At this point, we *should* be in suspend to RAM, as such,
+      -- execution should only resume on wakeup...
+  
+      logger.info("Kobo suspend: ZzZ ZzZ ZzZ? Write syscall returned: ", re)
+      if not re then
+          logger.err('write error: ', err_msg, err_code)
+      end
+      io.close(f)
+      -- NOTE: Ideally, we'd need a way to warn the user that suspending
+      -- gloriously failed at this point...
+      -- We can safely assume that just from a non-zero return code, without
+      -- looking at the detailed stderr message
+      -- (most of the failures we'll see are -EBUSY anyway)
+      -- For reference, when that happens to nickel, it appears to keep retrying
+      -- to wakeup & sleep ad nauseam,
+      -- which is where the non-sensical 1 -> mem -> 0 loop idea comes from...
+      -- cf. nickel_suspend_strace.txt for more details.
+  
+      logger.info("Kobo suspend: woke up!")
+    else
+      logger.info("Kobo suspend: sleepcover was opened before suspending")
     end
-    re, err_msg, err_code = f:write("mem\n")
-    -- NOTE: At this point, we *should* be in suspend to RAM, as such,
-    -- execution should only resume on wakeup...
-
-    logger.info("Kobo suspend: ZzZ ZzZ ZzZ? Write syscall returned: ", re)
-    if not re then
-        logger.err('write error: ', err_msg, err_code)
-    end
-    io.close(f)
-    -- NOTE: Ideally, we'd need a way to warn the user that suspending
-    -- gloriously failed at this point...
-    -- We can safely assume that just from a non-zero return code, without
-    -- looking at the detailed stderr message
-    -- (most of the failures we'll see are -EBUSY anyway)
-    -- For reference, when that happens to nickel, it appears to keep retrying
-    -- to wakeup & sleep ad nauseam,
-    -- which is where the non-sensical 1 -> mem -> 0 loop idea comes from...
-    -- cf. nickel_suspend_strace.txt for more details.
-
-    logger.info("Kobo suspend: woke up!")
-
     --[[
 
     if has_wakeup_count then
@@ -738,6 +759,12 @@ function Kobo:suspend()
     -- assuming Kobo:resume() will be called in 15 seconds
     logger.dbg("Kobo suspend: scheduling unexpected wakeup guard")
     UIManager:scheduleIn(15, check_unexpected_wakeup)
+
+    -- We are aborting suspend, but all events are already consumed to this
+    -- point, so UIManager won't have a chance to trigger resume normally
+    if not finalize_suspend then
+      require("ui/uimanager"):handleInputEvent("SleepCoverOpened")
+    end
 end
 
 function Kobo:resume()
